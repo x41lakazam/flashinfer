@@ -318,7 +318,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
               bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
               ActivationType base_activation_type = ActivationType::Swiglu,
-              Optional<TensorView> workspace_buffer = Optional<TensorView>{}) {
+              Optional<TensorView> workspace_buffer = Optional<TensorView>{},
+              Optional<TensorView> dispatch_expert_counts = Optional<TensorView>{}) {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
@@ -456,7 +457,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         enable_alltoall, use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
-        min_latency_mode, min_latency_params, enable_pdl, stream);
+        min_latency_mode, min_latency_params, enable_pdl, stream,
+        dispatch_expert_counts.has_value()
+            ? static_cast<int const*>(dispatch_expert_counts.value().data_ptr())
+            : nullptr);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -796,13 +800,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  bool swizzled_input_sf, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
                  int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-                 int64_t base_activation_type, Optional<TensorView> workspace_buffer) {
+                 int64_t base_activation_type, Optional<TensorView> workspace_buffer,
+                 Optional<TensorView> dispatch_expert_counts) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta,
                    swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank, cluster_size,
                    cluster_rank, enable_alltoall, min_latency_mode, profile_ids, enable_pdl,
-                   static_cast<ActivationType>(base_activation_type), workspace_buffer);
+                   static_cast<ActivationType>(base_activation_type), workspace_buffer,
+                   dispatch_expert_counts);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(

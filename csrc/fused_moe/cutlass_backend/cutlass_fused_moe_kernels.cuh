@@ -974,6 +974,84 @@ void threeStepBuildExpertMapsSortFirstToken(
                        stream);
 }
 
+// ===================== EXPERT_MAJOR dispatch fast path ============================
+//
+// buildExpertMapsFromKnownCounts is an alternative to threeStepBuildExpertMapsSortFirstToken /
+// fusedBuildExpertMapsSortFirstToken for callers who already know the row->expert assignment is
+// fixed-stride and front-packed, i.e. row r belongs to expert (r / cap), and only the first
+// dispatch_expert_counts[e] rows of expert e's [e*cap, (e+1)*cap) block are real tokens (the rest
+// is padding). This is exactly the layout NCCL EP's EXPERT_MAJOR dispatch produces
+// (flashinfer/moe_ep/backends/split/kernel/fused_moe/bridge.py). No sort is needed: the
+// permutation is a direct index computation from a small per-expert prefix sum.
+//
+// Real tokens are packed to permuted rows [0, R) (R = sum(dispatch_expert_counts)), grouped by
+// expert in ascending order -- exactly what the general sort would have produced for this input,
+// but computed in O(num_experts_per_node) instead of a full O(num_rows) sort. This also shrinks
+// expert_first_token_offset[num_experts_per_node] (the "num_valid_tokens" bound consumed by
+// expandInputRowsKernel and the grouped GEMM sizing) from num_rows down to R, so the downstream
+// gather/GEMM only touch real tokens, not the padding.
+//
+// Padding rows still need a valid (but never-read-for-content) permuted slot so that the
+// finalize/reduce stage -- which walks every unpermuted row in [0, num_rows) -- does not index
+// out of bounds. They are packed to permuted rows [R, num_rows) in the same per-expert order;
+// nothing downstream depends on the contents written there (nothing gathers or scatters via
+// combine for those tokens), matching the pre-existing "padded rows compute garbage, correct at a
+// perf cost" contract documented in bridge.py.
+__global__ void computeExpertOffsetsFromCountsKernel(int const* dispatch_expert_counts,
+                                                     int64_t* expert_first_token_offset,
+                                                     int const num_experts_per_node) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    int64_t running = 0;
+    for (int e = 0; e < num_experts_per_node; e++) {
+      expert_first_token_offset[e] = running;
+      running += dispatch_expert_counts[e];
+    }
+    expert_first_token_offset[num_experts_per_node] = running;
+  }
+}
+
+__global__ void buildExpertMapsFromKnownCountsKernel(int const* dispatch_expert_counts,
+                                                     int64_t const* expert_first_token_offset,
+                                                     int* permuted_row_to_unpermuted_row,
+                                                     int* unpermuted_row_to_permuted_row,
+                                                     int64_t const cap,
+                                                     int const num_experts_per_node) {
+  int const e = blockIdx.x;
+  if (e >= num_experts_per_node) return;
+
+  int64_t const offset = expert_first_token_offset[e];
+  int64_t const real_count = dispatch_expert_counts[e];
+  int64_t const total_valid = expert_first_token_offset[num_experts_per_node];
+  // Padding rows for expert e start right after expert e's real rows would have landed in the
+  // fully-packed [0, num_rows) layout, i.e. total_valid + (rows padded away by experts < e).
+  int64_t const pad_offset = total_valid + (int64_t)e * cap - offset;
+
+  for (int64_t local = threadIdx.x; local < cap; local += blockDim.x) {
+    int64_t const unpermuted_row = (int64_t)e * cap + local;
+    if (local < real_count) {
+      int64_t const permuted_row = offset + local;
+      permuted_row_to_unpermuted_row[permuted_row] = static_cast<int>(unpermuted_row);
+      unpermuted_row_to_permuted_row[unpermuted_row] = static_cast<int>(permuted_row);
+    } else {
+      int64_t const permuted_row = pad_offset + (local - real_count);
+      unpermuted_row_to_permuted_row[unpermuted_row] = static_cast<int>(permuted_row);
+    }
+  }
+}
+
+void buildExpertMapsFromKnownCounts(int const* dispatch_expert_counts,
+                                    int64_t* expert_first_token_offset,
+                                    int* permuted_row_to_unpermuted_row,
+                                    int* unpermuted_row_to_permuted_row, int64_t const cap,
+                                    int const num_experts_per_node, cudaStream_t stream) {
+  computeExpertOffsetsFromCountsKernel<<<1, 32, 0, stream>>>(
+      dispatch_expert_counts, expert_first_token_offset, num_experts_per_node);
+  constexpr int kBlockSize = 128;
+  buildExpertMapsFromKnownCountsKernel<<<num_experts_per_node, kBlockSize, 0, stream>>>(
+      dispatch_expert_counts, expert_first_token_offset, permuted_row_to_unpermuted_row,
+      unpermuted_row_to_permuted_row, cap, num_experts_per_node);
+}
+
 // ============================== Infer GEMM sizes =================================
 // TODO Could linear search be better for small # experts
 template <class T>
@@ -4031,7 +4109,8 @@ void CutlassMoeFCRunner<
                     MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                     bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                     bool use_mxfp8_act_scaling, bool min_latency_mode,
-                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
+                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+                    int const* dispatch_expert_counts) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
                                               std::is_same<WeightType, cutlass::uint4b_t>::value ||
                                               use_wfp4a16;
@@ -4254,23 +4333,46 @@ void CutlassMoeFCRunner<
                 min_latency_params.active_expert_global_ids, enable_pdl);
     sync_check_cuda_error(stream);
   } else {
-    bool fused_prologue_result = false;
-    if (!use_sm90_mixed_input_gemm) {
-      // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
-      // W4AFP8
-      fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
-          token_selected_experts, permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row,
-          expert_first_token_offset_, num_rows, num_experts_per_node, experts_per_token,
-          start_expert, end_expert, enable_pdl, stream);
-    }
+    if (dispatch_expert_counts != nullptr) {
+      // EXPERT_MAJOR fast path: the caller (flashinfer.moe_ep NCCL EP dispatch, EXPERT_MAJOR
+      // layout) already knows the row->expert assignment is fixed-stride and front-packed, so no
+      // sort is needed -- see buildExpertMapsFromKnownCounts above for the layout contract.
+      // Falls through into the same expand/GEMM code below as the sort-based prologue.
+      TLLM_CHECK_WITH_INFO(experts_per_token == 1,
+                           "dispatch_expert_counts fast path requires experts_per_token == 1 "
+                           "(EXPERT_MAJOR pre-routed dispatch contract)");
+      TLLM_CHECK_WITH_INFO(
+          !use_lora && !min_latency_mode && !use_deepseek_fp8_block_scale &&
+              !use_mxfp8_act_scaling && !use_fp4 && !use_w4afp8 && !use_wfp4a16 && !use_wfp4afp8,
+          "dispatch_expert_counts fast path only supports the plain (non-quantized-permute) "
+          "activation path used by the moe_ep EXPERT_MAJOR default");
+      TLLM_CHECK_WITH_INFO(num_rows % num_experts_per_node == 0,
+                           "dispatch_expert_counts fast path requires num_rows to be an exact "
+                           "multiple of num_experts_per_node (the EXPERT_MAJOR cap stride)");
+      buildExpertMapsFromKnownCounts(dispatch_expert_counts, expert_first_token_offset_,
+                                     permuted_row_to_unpermuted_row_,
+                                     unpermuted_row_to_permuted_row,
+                                     num_rows / num_experts_per_node, num_experts_per_node, stream);
+    } else {
+      bool fused_prologue_result = false;
+      if (!use_sm90_mixed_input_gemm) {
+        // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
+        // W4AFP8
+        fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
+            token_selected_experts, permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row,
+            expert_first_token_offset_, num_rows, num_experts_per_node, experts_per_token,
+            start_expert, end_expert, enable_pdl, stream);
+      }
 
-    if (!fused_prologue_result) {
-      TLLM_LOG_TRACE("Falling back to unfused prologue");
-      threeStepBuildExpertMapsSortFirstToken(
-          token_selected_experts, permuted_token_selected_experts_, permuted_row_to_unpermuted_row_,
-          unpermuted_row_to_permuted_row, expert_first_token_offset_, blocked_expert_counts_,
-          blocked_expert_counts_cumsum_, blocked_row_to_unpermuted_row_, num_rows,
-          num_experts_per_node, experts_per_token, start_expert, enable_pdl, stream);
+      if (!fused_prologue_result) {
+        TLLM_LOG_TRACE("Falling back to unfused prologue");
+        threeStepBuildExpertMapsSortFirstToken(
+            token_selected_experts, permuted_token_selected_experts_,
+            permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row,
+            expert_first_token_offset_, blocked_expert_counts_, blocked_expert_counts_cumsum_,
+            blocked_row_to_unpermuted_row_, num_rows, num_experts_per_node, experts_per_token,
+            start_expert, enable_pdl, stream);
+      }
     }
 
     sync_check_cuda_error(stream);

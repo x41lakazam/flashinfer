@@ -930,9 +930,14 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_wfp4afp8_humming: bool = False,
         profile_ids: Optional[List[int]] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        dispatch_expert_counts: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
+        if dispatch_expert_counts is not None and min_latency_mode:
+            raise ValueError(
+                "dispatch_expert_counts is not supported with min_latency_mode."
+            )
 
         # allocate workspace for profiling
         moe_runner = MoERunner(
@@ -1027,7 +1032,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             if min_latency_mode
             else []
         )
-        run_moe(
+        common_args = (
             output,
             input,
             token_selected_experts,
@@ -1058,6 +1063,12 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             activation_type,
             workspace_buffer,
         )
+        if min_latency_mode:
+            # run_moe_min_latency's FFI signature does not carry the
+            # EXPERT_MAJOR dispatch_expert_counts fast-path argument.
+            run_moe(*common_args)
+        else:
+            run_moe(*common_args, dispatch_expert_counts)
 
         return (
             output
@@ -1239,6 +1250,7 @@ def cutlass_fused_moe(
     *,
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
+    dispatch_expert_counts: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1413,6 +1425,18 @@ def cutlass_fused_moe(
         their own buffer. A buffer sized for the maximum token count is valid for all
         smaller counts on the same call.
 
+    dispatch_expert_counts : Optional[torch.Tensor]
+        EXPERT_MAJOR fast-path opt-in. ``int32`` tensor of shape ``[num_experts_on_rank]``
+        giving the real (non-padding) token count for each local expert, when ``input`` is
+        already laid out expert-major with a fixed stride (row ``r`` belongs to expert
+        ``r // (num_rows // num_experts_on_rank)``, and only the first
+        ``dispatch_expert_counts[e]`` rows of that block are real tokens). When set, the
+        runner skips its internal sort-based routing prologue and computes the permutation
+        directly from these counts, which also lets the grouped GEMM and the row-expand
+        step skip the padding rows. Requires ``top_k == 1`` and is incompatible with
+        ``min_latency_mode``, LoRA, and the block-scaled / FP4 / W4A8 quant paths. ``None``
+        (default) uses the normal sort-based prologue for every row.
+
     Returns
     -------
     out: torch.Tensor
@@ -1508,6 +1532,7 @@ def cutlass_fused_moe(
             use_wfp4afp8_humming=use_wfp4afp8_humming,
             profile_ids=profile_ids,
             workspace_buffer=workspace_buffer,
+            dispatch_expert_counts=dispatch_expert_counts,
         )
 
 
