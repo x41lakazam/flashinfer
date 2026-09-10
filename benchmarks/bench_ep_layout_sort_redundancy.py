@@ -180,7 +180,7 @@ def check_correctness(shapes: list[Shape]) -> bool:
             batch = make_batch(shape)
             out_base = run_baseline(batch)
             out_fast = run_fast_path(batch)
-        except torch.cuda.OutOfMemoryError:
+        except (torch.cuda.OutOfMemoryError, MemoryError):
             torch.cuda.empty_cache()
             print(
                 f"[correctness] E={shape.num_local_experts} cap={shape.cap} H={shape.hidden}: "
@@ -230,7 +230,7 @@ def bench(
                 dry_run_iters=dry_run_iters,
                 repeat_iters=repeat_iters,
             )
-        except torch.cuda.OutOfMemoryError:
+        except (torch.cuda.OutOfMemoryError, MemoryError):
             torch.cuda.empty_cache()
             print(
                 f"E={shape.num_local_experts:3d} cap={shape.cap:4d} H={shape.hidden:5d}: SKIP (OOM)"
