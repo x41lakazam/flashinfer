@@ -997,15 +997,38 @@ void threeStepBuildExpertMapsSortFirstToken(
 // nothing downstream depends on the contents written there (nothing gathers or scatters via
 // combine for those tokens), matching the pre-existing "padded rows compute garbage, correct at a
 // perf cost" contract documented in bridge.py.
+// Block-wide exclusive scan over the per-expert counts. One block; experts are
+// processed in tiles of kBlockSize with a running aggregate carried across tiles,
+// so this handles any num_experts_per_node without a second pass.
+//
+// cub returns block_aggregate to every thread, so `running` stays identical across
+// the block and needs no broadcast. The __syncthreads() is required before the next
+// iteration reuses temp_storage.
+template <int kBlockSize>
 __global__ void computeExpertOffsetsFromCountsKernel(int const* dispatch_expert_counts,
                                                      int64_t* expert_first_token_offset,
                                                      int const num_experts_per_node) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    int64_t running = 0;
-    for (int e = 0; e < num_experts_per_node; e++) {
-      expert_first_token_offset[e] = running;
-      running += dispatch_expert_counts[e];
+  using BlockScan = cub::BlockScan<int64_t, kBlockSize>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+
+  int64_t running = 0;
+  for (int base = 0; base < num_experts_per_node; base += kBlockSize) {
+    int const e = base + static_cast<int>(threadIdx.x);
+    int64_t const count =
+        (e < num_experts_per_node) ? static_cast<int64_t>(dispatch_expert_counts[e]) : int64_t{0};
+
+    int64_t offset = 0;
+    int64_t aggregate = 0;
+    BlockScan(temp_storage).ExclusiveSum(count, offset, aggregate);
+
+    if (e < num_experts_per_node) {
+      expert_first_token_offset[e] = running + offset;
     }
+    running += aggregate;
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
     expert_first_token_offset[num_experts_per_node] = running;
   }
 }
@@ -1044,7 +1067,8 @@ void buildExpertMapsFromKnownCounts(int const* dispatch_expert_counts,
                                     int* permuted_row_to_unpermuted_row,
                                     int* unpermuted_row_to_permuted_row, int64_t const cap,
                                     int const num_experts_per_node, cudaStream_t stream) {
-  computeExpertOffsetsFromCountsKernel<<<1, 32, 0, stream>>>(
+  constexpr int kScanBlockSize = 256;
+  computeExpertOffsetsFromCountsKernel<kScanBlockSize><<<1, kScanBlockSize, 0, stream>>>(
       dispatch_expert_counts, expert_first_token_offset, num_experts_per_node);
   constexpr int kBlockSize = 128;
   buildExpertMapsFromKnownCountsKernel<<<num_experts_per_node, kBlockSize, 0, stream>>>(

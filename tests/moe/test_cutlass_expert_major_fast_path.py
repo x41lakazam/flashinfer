@@ -122,6 +122,26 @@ def test_fast_path_matches_sort_path(num_local_experts, cap, fill_frac):
     torch.testing.assert_close(out_base[mask], out_fast[mask], rtol=2e-2, atol=2e-2)
 
 
+def test_expert_count_exceeding_scan_block():
+    """Exercise the multi-tile path of the per-expert offset scan.
+
+    computeExpertOffsetsFromCountsKernel scans in tiles of 256 experts and carries a
+    running aggregate across tiles. Every other case here stays inside a single tile,
+    so without this the cross-tile carry would be untested. 257 experts is the
+    smallest count that forces a second iteration.
+    """
+    _skip_if_unsupported()
+    batch = _make_expert_major_batch(
+        257, 8, hidden=256, intermediate=128, fill_frac=0.5, seed=7
+    )
+    out_base = _as_tensor(_run(batch, counts=None))
+    out_fast = _as_tensor(_run(batch, counts=batch["counts"]))
+
+    mask = _real_row_mask(batch)
+    assert mask.any()
+    torch.testing.assert_close(out_base[mask], out_fast[mask], rtol=2e-2, atol=2e-2)
+
+
 def test_fully_packed_batch_matches_everywhere():
     """With counts == cap there is no padding, so every row must match.
 
