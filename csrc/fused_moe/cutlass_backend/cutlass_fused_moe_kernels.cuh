@@ -1004,9 +1004,17 @@ void threeStepBuildExpertMapsSortFirstToken(
 // cub returns block_aggregate to every thread, so `running` stays identical across
 // the block and needs no broadcast. The __syncthreads() is required before the next
 // iteration reuses temp_storage.
+// Per-expert start offsets are rounded up to this many rows. The TMA warp-specialized
+// grouped GEMM is materially slower when a group starts at an arbitrary row (measured
+// 1.84x on H100 at E=32/cap=128), and moe_sort tile-aligns its per-expert starts for the
+// same reason. The cost is alignment padding the GEMM computes and nobody reads; it is
+// bounded by cap per expert, so the fast path never exceeds the sort path's row count.
+static constexpr int64_t kExpertOffsetAlignment = 128;
+
 template <int kBlockSize>
 __global__ void computeExpertOffsetsFromCountsKernel(int const* dispatch_expert_counts,
                                                      int64_t* expert_first_token_offset,
+                                                     int64_t const cap,
                                                      int const num_experts_per_node) {
   using BlockScan = cub::BlockScan<int64_t, kBlockSize>;
   __shared__ typename BlockScan::TempStorage temp_storage;
@@ -1014,8 +1022,14 @@ __global__ void computeExpertOffsetsFromCountsKernel(int const* dispatch_expert_
   int64_t running = 0;
   for (int base = 0; base < num_experts_per_node; base += kBlockSize) {
     int const e = base + static_cast<int>(threadIdx.x);
-    int64_t const count =
+    int64_t raw =
         (e < num_experts_per_node) ? static_cast<int64_t>(dispatch_expert_counts[e]) : int64_t{0};
+    // Clamp to cap so the aligned total can never exceed num_experts_per_node * cap, the
+    // size of the permuted buffer. When cap is a multiple of the alignment (the usual
+    // case, cap = max_tokens_per_rank * world_size) the clamp never binds.
+    int64_t const aligned =
+        (raw + kExpertOffsetAlignment - 1) / kExpertOffsetAlignment * kExpertOffsetAlignment;
+    int64_t const count = (e < num_experts_per_node) ? min(aligned, cap) : int64_t{0};
 
     int64_t offset = 0;
     int64_t aggregate = 0;
@@ -1044,10 +1058,9 @@ __global__ void buildExpertMapsFromKnownCountsKernel(int const* dispatch_expert_
 
   int64_t const offset = expert_first_token_offset[e];
   int64_t const real_count = dispatch_expert_counts[e];
-  int64_t const total_valid = expert_first_token_offset[num_experts_per_node];
-  // Padding rows for expert e start right after expert e's real rows would have landed in the
-  // fully-packed [0, num_rows) layout, i.e. total_valid + (rows padded away by experts < e).
-  int64_t const pad_offset = total_valid + (int64_t)e * cap - offset;
+  // Slots this expert owns in the permuted buffer. With tile-aligned offsets this is
+  // >= real_count; the difference is alignment padding that no unpermuted row maps to.
+  int64_t const slots = expert_first_token_offset[e + 1] - offset;
 
   for (int64_t local = threadIdx.x; local < cap; local += blockDim.x) {
     int64_t const unpermuted_row = (int64_t)e * cap + local;
@@ -1056,9 +1069,19 @@ __global__ void buildExpertMapsFromKnownCountsKernel(int const* dispatch_expert_
       permuted_row_to_unpermuted_row[permuted_row] = static_cast<int>(unpermuted_row);
       unpermuted_row_to_permuted_row[unpermuted_row] = static_cast<int>(permuted_row);
     } else {
-      int64_t const permuted_row = pad_offset + (local - real_count);
-      unpermuted_row_to_permuted_row[unpermuted_row] = static_cast<int>(permuted_row);
+      // EP padding row: no permuted slot. finalizeMoeRoutingKernel skips negative
+      // entries (it tests expanded_permuted_row < 0 before using it as an index), so
+      // -1 keeps these rows out of the reduction without reserving space for them.
+      unpermuted_row_to_permuted_row[unpermuted_row] = -1;
     }
+  }
+
+  // Alignment-gap slots sit inside [0, num_valid_tokens), so expandInputRowsKernel will
+  // walk them and dereference permuted_row_to_unpermuted_row without a bounds check.
+  // Point them at this expert's first row: the gathered values are never read back
+  // (no unpermuted row maps here), but the index must be in range.
+  for (int64_t g = real_count + threadIdx.x; g < slots; g += blockDim.x) {
+    permuted_row_to_unpermuted_row[offset + g] = static_cast<int>((int64_t)e * cap);
   }
 }
 
@@ -1069,7 +1092,7 @@ void buildExpertMapsFromKnownCounts(int const* dispatch_expert_counts,
                                     int const num_experts_per_node, cudaStream_t stream) {
   constexpr int kScanBlockSize = 256;
   computeExpertOffsetsFromCountsKernel<kScanBlockSize><<<1, kScanBlockSize, 0, stream>>>(
-      dispatch_expert_counts, expert_first_token_offset, num_experts_per_node);
+      dispatch_expert_counts, expert_first_token_offset, cap, num_experts_per_node);
   constexpr int kBlockSize = 128;
   buildExpertMapsFromKnownCountsKernel<<<num_experts_per_node, kBlockSize, 0, stream>>>(
       dispatch_expert_counts, expert_first_token_offset, permuted_row_to_unpermuted_row,
