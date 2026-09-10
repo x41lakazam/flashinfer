@@ -290,6 +290,43 @@ def bench(
     return rows
 
 
+def summarize(rows: list[dict]) -> None:
+    """Print the regression rate and speedup distribution per ``cap`` bucket.
+
+    This is the aggregation the PR quotes. Keeping it in the benchmark means a
+    reviewer reproduces the reported tables from one command, without a separate
+    analysis script.
+    """
+    import statistics
+    from collections import defaultdict
+
+    by_cap: dict[int, list[float]] = defaultdict(list)
+    for r in rows:
+        if r.get("speedup") is None:
+            continue
+        by_cap[int(r["cap"])].append(float(r["speedup"]))
+    if not by_cap:
+        print("\nNo timed shapes to summarize.")
+        return
+
+    print("\n| cap | n | regressed (<1.0x) | min | median | max |")
+    print("|---|---|---|---|---|---|")
+    allv: list[float] = []
+    for cap in sorted(by_cap):
+        v = by_cap[cap]
+        allv += v
+        n_reg = sum(1 for x in v if x < 1.0)
+        print(
+            f"| {cap} | {len(v)} | {n_reg} ({100 * n_reg / len(v):.0f}%) "
+            f"| {min(v):.2f}x | {statistics.median(v):.2f}x | {max(v):.2f}x |"
+        )
+    n_reg = sum(1 for x in allv if x < 1.0)
+    print(
+        f"\nOverall: {n_reg}/{len(allv)} regressed ({100 * n_reg / len(allv):.1f}%), "
+        f"median {statistics.median(allv):.2f}x, max {max(allv):.2f}x, min {min(allv):.2f}x"
+    )
+
+
 def write_csv(rows: list[dict], path: str) -> None:
     if not rows:
         return
@@ -489,6 +526,8 @@ if __name__ == "__main__":
     rows = bench(
         shapes, repeat_iters=args.repeat_iters, gpu_tag=args.gpu_tag or gpu_name
     )
+
+    summarize(rows)
 
     if args.csv:
         write_csv(rows, args.csv)
